@@ -1,0 +1,1046 @@
+package com.y3.fiyattakip
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.work.*
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.*
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.TimeUnit
+
+data class FiyatNoktasi(
+    val zaman: String,
+    val fiyat: Double
+)
+
+data class TakipUrunu(
+    val id: String = UUID.randomUUID().toString(),
+    val ad: String,
+    val url: String,
+    val hedefFiyat: Double,
+    val sonFiyat: Double,
+    val sonKontrol: String,
+    val durum: String,
+    val gecmis: List<FiyatNoktasi> = emptyList()
+)
+
+object VeriDeposu {
+    private const val PREF_NAME = "y3_fiyat_takip_prefs"
+    private const val KEY_URUNLER = "urun_listesi"
+    private const val KEY_PERIYOT_DK = "yenileme_dk"
+    private val gson = Gson()
+
+    fun urunleriYukle(context: Context): MutableList<TakipUrunu> {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val json = prefs.getString(KEY_URUNLER, null) ?: return mutableListOf()
+        val type = object : TypeToken<MutableList<TakipUrunu>>() {}.type
+        return try {
+            gson.fromJson(json, type) ?: mutableListOf()
+        } catch (_: Exception) {
+            mutableListOf()
+        }
+    }
+
+    fun urunleriKaydet(context: Context, liste: List<TakipUrunu>) {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(KEY_URUNLER, gson.toJson(liste)).apply()
+    }
+
+    fun periyotYukle(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_PERIYOT_DK, 30)
+    }
+
+    fun periyotKaydet(context: Context, dk: Int) {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putInt(KEY_PERIYOT_DK, dk).apply()
+    }
+}
+
+object FiyatMotoru {
+    private const val USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    data class CekimSonucu(
+        val basarili: Boolean,
+        val baslik: String?,
+        val fiyat: Double?,
+        val mesaj: String
+    )
+
+    suspend fun urunFiyatiCek(context: Context, url: String): CekimSonucu {
+        val temizUrl = url.trim()
+        if (!temizUrl.startsWith("http://") && !temizUrl.startsWith("https://")) {
+            return CekimSonucu(false, null, null, "Geçersiz URL (http/https gerekli)")
+        }
+
+        val hizliSonuc = withContext(Dispatchers.IO) {
+            try {
+                val doc = Jsoup.connect(temizUrl)
+                    .userAgent(USER_AGENT)
+                    .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .timeout(10000)
+                    .followRedirects(true)
+                    .get()
+                htmlIcindenFiyatBul(doc, doc.outerHtml(), temizUrl)
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (hizliSonuc != null && hizliSonuc.basarili) {
+            return hizliSonuc
+        }
+
+        val renderedHtml = webViewIleHtmlCek(context, temizUrl)
+        if (!renderedHtml.isNullOrBlank() && renderedHtml.length > 500) {
+            return withContext(Dispatchers.Default) {
+                val doc = Jsoup.parse(renderedHtml, temizUrl)
+                val sonuc = htmlIcindenFiyatBul(doc, renderedHtml, temizUrl)
+                sonuc.copy(mesaj = "WebView: ${sonuc.mesaj}")
+            }
+        }
+
+        return CekimSonucu(false, hizliSonuc?.baslik, null, "Sayfa yüklenemedi veya bot koruması")
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun webViewIleHtmlCek(context: Context, url: String): String? {
+        return withTimeoutOrNull(28000L) {
+            withContext(Dispatchers.Main) {
+                suspendCancellableCoroutine { cont ->
+                    val webView = WebView(context.applicationContext)
+                    var tamamlandi = false
+
+                    fun bitir(sonuc: String?) {
+                        if (!tamamlandi) {
+                            tamamlandi = true
+                            try {
+                                webView.stopLoading()
+                                webView.destroy()
+                            } catch (_: Exception) {
+                            }
+                            if (cont.isActive) cont.resumeWith(Result.success(sonuc))
+                        }
+                    }
+
+                    webView.settings.javaScriptEnabled = true
+                    webView.settings.domStorageEnabled = true
+                    webView.settings.userAgentString = USER_AGENT
+                    webView.settings.loadsImagesAutomatically = false
+
+                    webView.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, finishedUrl: String?) {
+                            view?.postDelayed({
+                                if (!tamamlandi) {
+                                    view.evaluateJavascript(
+                                        "(function(){return document.documentElement.outerHTML;})();"
+                                    ) { rawJson ->
+                                        val html = try {
+                                            JSONTokener(rawJson ?: "").nextValue() as? String
+                                        } catch (_: Exception) {
+                                            null
+                                        }
+                                        bitir(html)
+                                    }
+                                }
+                            }, 4500L)
+                        }
+                    }
+
+                    cont.invokeOnCancellation {
+                        try {
+                            webView.stopLoading()
+                            webView.destroy()
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    webView.loadUrl(url)
+                }
+            }
+        }
+    }
+
+    private fun htmlIcindenFiyatBul(doc: Document, html: String, url: String): CekimSonucu {
+        val baslik = doc.select("meta[property=og:title]").attr("content")
+            .ifBlank { doc.title() }
+            .trim()
+            .take(90)
+            .ifBlank { "Takip Edilen Ürün" }
+
+        if (url.lowercase().contains("hepsiburada.com")) {
+            val hbSonuc = hepsiburadaFiyatBul(doc, html)
+            if (hbSonuc != null) {
+                return CekimSonucu(true, baslik, hbSonuc.first, hbSonuc.second)
+            }
+        }
+
+        val metaSeciciler = listOf(
+            "meta[property=product:price:amount]",
+            "meta[property=og:price:amount]",
+            "meta[name=twitter:data1]",
+            "meta[itemprop=price]"
+        )
+        for (secici in metaSeciciler) {
+            val f = fiyatMetniniSayiyaCevir(doc.select(secici).attr("content"))
+            if (f != null) return CekimSonucu(true, baslik, f, "Meta etiketinden okundu")
+        }
+
+        for (script in doc.select("script[type=application/ld+json]")) {
+            val f = jsonLdIcindenFiyatBul(script.data())
+            if (f != null) return CekimSonucu(true, baslik, f, "JSON-LD verisinden okundu")
+        }
+
+        val whole = doc.selectFirst(".a-price .a-price-whole")
+        if (whole != null) {
+            val tam = whole.text().replace(Regex("[^\\d]"), "")
+            val kurus = doc.selectFirst(".a-price .a-price-fraction")?.text()?.replace(Regex("[^\\d]"), "") ?: "00"
+            val f = "$tam.$kurus".toDoubleOrNull()
+            if (f != null && f > 0) return CekimSonucu(true, baslik, f, "Amazon fiyat bloğundan okundu")
+        }
+
+        val cssSeciciler = listOf(
+            ".prc-dsc",
+            ".prc-slg",
+            ".prc-box-dscntd",
+            "[data-testid=price-current-price]",
+            "[data-test-id=price-current-price]",
+            "[data-test-id=default-price]",
+            ".a-price .a-offscreen",
+            ".pt_v8",
+            ".pb_v8",
+            ".newPrice ins",
+            ".unf-p-summary-price",
+            "[data-test=product-price]",
+            ".product-list__price",
+            "[itemprop=price]"
+        )
+        for (secici in cssSeciciler) {
+            val el = doc.selectFirst(secici)
+            if (el != null) {
+                val ham = el.attr("content").ifBlank { el.text() }
+                val f = fiyatMetniniSayiyaCevir(ham)
+                if (f != null) return CekimSonucu(true, baslik, f, "CSS seçicisinden okundu")
+            }
+        }
+
+        val scriptFiyat = scriptIciFiyatBul(html)
+        if (scriptFiyat != null) {
+            return CekimSonucu(true, baslik, scriptFiyat, "Sayfa JSON verisinden okundu")
+        }
+
+        val yasakli = listOf("sigorta", "garanti", "ek hizmet", "taksit", "kupon", "kargo")
+        for (el in doc.select("span, div, p, ins, strong, b")) {
+            val txt = el.text().trim()
+            if ((txt.contains("TL") || txt.contains("₺")) && txt.length in 3..26) {
+                val ebeveyn = (el.parent()?.text() ?: "").lowercase()
+                if (yasakli.any { ebeveyn.contains(it) }) continue
+                val f = fiyatMetniniSayiyaCevir(txt)
+                if (f != null && f >= 20.0) {
+                    return CekimSonucu(true, baslik, f, "Metin taraması ile okundu")
+                }
+            }
+        }
+
+        return CekimSonucu(false, baslik, null, "Fiyat bulunamadı (${baslik.take(24)})")
+    }
+
+    private fun hepsiburadaFiyatBul(doc: Document, html: String): Pair<Double, String>? {
+        val hbSeciciler = listOf(
+            "[data-test-id=default-price]",
+            "[data-test-id=price-current-price]",
+            "[data-test-id=final-price]",
+            "div[data-test-id=price]",
+            "span[data-bind*=currentPrice]"
+        )
+        for (secici in hbSeciciler) {
+            val kapsayici = doc.selectFirst(secici)
+            if (kapsayici != null) {
+                val kopya = Jsoup.parseBodyFragment(kapsayici.outerHtml())
+                kopya.select("del, s, [data-test-id=prev-price], [class*=old], [class*=prev]").remove()
+                val f = fiyatMetniniSayiyaCevir(kopya.text())
+                if (f != null) return Pair(f, "Hepsiburada ana fiyat")
+            }
+        }
+
+        val desenler = listOf(
+            Regex("\"product_prices\"\\s*:\\s*\\[\\s*\"([0-9.,]+)\""),
+            Regex("\"product_unit_prices\"\\s*:\\s*\\[\\s*\"([0-9.,]+)\""),
+            Regex("\"finalPrice\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+            Regex("\"currentPrice\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+            Regex("\"price\"\\s*:\\s*([0-9]+(?:\\.[0-9]{1,2})?)\\s*,\\s*\"currency\"\\s*:\\s*\"TRY\"")
+        )
+        for (desen in desenler) {
+            val m = desen.find(html)
+            if (m != null) {
+                val f = fiyatMetniniSayiyaCevir(m.groupValues[1])
+                if (f != null) return Pair(f, "Hepsiburada sayfa verisi")
+            }
+        }
+        return null
+    }
+
+    private fun scriptIciFiyatBul(html: String): Double? {
+        val desenler = listOf(
+            Regex("\"discountedPrice\"\\s*:\\s*\\{[^}]*?\"value\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+            Regex("\"sellingPrice\"\\s*:\\s*\\{[^}]*?\"value\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+            Regex("\"discountedPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"sellingPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"currentPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"finalPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"priceAmount\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"salePrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+            Regex("\"lowPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?")
+        )
+        for (d in desenler) {
+            val m = d.find(html)
+            if (m != null) {
+                val f = fiyatMetniniSayiyaCevir(m.groupValues[1])
+                if (f != null && f >= 10.0) return f
+            }
+        }
+        return null
+    }
+
+    private fun jsonLdIcindenFiyatBul(rawJson: String): Double? {
+        return try {
+            val trimmed = rawJson.trim()
+            if (trimmed.startsWith("{")) {
+                offersFiyatOku(JSONObject(trimmed))
+            } else if (trimmed.startsWith("[")) {
+                val arr = JSONArray(trimmed)
+                for (i in 0 until arr.length()) {
+                    offersFiyatOku(arr.getJSONObject(i))?.let { return it }
+                }
+                null
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun offersFiyatOku(obj: JSONObject): Double? {
+        for (k in listOf("price", "lowPrice", "highPrice")) {
+            if (obj.has(k)) {
+                fiyatMetniniSayiyaCevir(obj.optString(k))?.let { return it }
+            }
+        }
+        if (obj.has("offers")) {
+            val offers = obj.get("offers")
+            if (offers is JSONObject) return offersFiyatOku(offers)
+            if (offers is JSONArray) {
+                for (i in 0 until offers.length()) {
+                    offersFiyatOku(offers.getJSONObject(i))?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
+    fun fiyatMetniniSayiyaCevir(metin: String?): Double? {
+        if (metin.isNullOrBlank()) return null
+        val temiz = metin.replace("TL", "", ignoreCase = true)
+            .replace("₺", "")
+            .replace("TRY", "", ignoreCase = true)
+            .trim()
+        val eslesme = Regex("""\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?""")
+            .find(temiz)?.value ?: return null
+
+        val normalize = when {
+            eslesme.contains(".") && eslesme.contains(",") -> {
+                if (eslesme.lastIndexOf(",") > eslesme.lastIndexOf(".")) {
+                    eslesme.replace(".", "").replace(",", ".")
+                } else {
+                    eslesme.replace(",", "")
+                }
+            }
+            eslesme.contains(",") -> {
+                val parcalar = eslesme.split(",")
+                if (parcalar.last().length == 2) eslesme.replace(",", ".")
+                else eslesme.replace(",", "")
+            }
+            eslesme.contains(".") -> {
+                val parcalar = eslesme.split(".")
+                if (parcalar.last().length == 3 && parcalar.first().length <= 3) {
+                    eslesme.replace(".", "")
+                } else eslesme
+            }
+            else -> eslesme
+        }
+        val sonuc = normalize.toDoubleOrNull() ?: return null
+        return if (sonuc in 1.0..5_000_000.0) sonuc else null
+    }
+}
+
+class FiyatKontrolWorker(
+    appContext: Context,
+    workerParams: WorkerParameters
+) : CoroutineWorker(appContext, workerParams) {
+
+    override suspend fun doWork(): Result {
+        val liste = VeriDeposu.urunleriYukle(applicationContext)
+        if (liste.isEmpty()) return Result.success()
+
+        val saatFormat = SimpleDateFormat("dd.MM HH:mm", Locale.forLanguageTag("tr-TR"))
+        val zamanStr = saatFormat.format(Date())
+
+        for (i in liste.indices) {
+            val u = liste[i]
+            val sonuc = FiyatMotoru.urunFiyatiCek(applicationContext, u.url)
+            if (sonuc.basarili && sonuc.fiyat != null) {
+                val yeniGecmis = (u.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                if ((u.sonFiyat > 0 && sonuc.fiyat < u.sonFiyat) ||
+                    (u.hedefFiyat > 0 && sonuc.fiyat <= u.hedefFiyat)
+                ) {
+                    bildirimGoster(
+                        applicationContext,
+                        "İndirim Yakalandı: ${u.ad}",
+                        "Yeni fiyat: ${String.format(Locale.forLanguageTag("tr-TR"), "%,.2f", sonuc.fiyat)} TL"
+                    )
+                }
+                liste[i] = u.copy(
+                    sonFiyat = sonuc.fiyat,
+                    sonKontrol = zamanStr,
+                    durum = sonuc.mesaj,
+                    gecmis = yeniGecmis
+                )
+            } else {
+                liste[i] = u.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+            }
+        }
+
+        VeriDeposu.urunleriKaydet(applicationContext, liste)
+        return Result.success()
+    }
+
+    private fun bildirimGoster(context: Context, baslik: String, icerik: String) {
+        val kanalId = "y3_indirim_kanali"
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val kanal = NotificationChannel(kanalId, "Fiyat İndirim Uyarıları", NotificationManager.IMPORTANCE_HIGH)
+            manager.createNotificationChannel(kanal)
+        }
+        val bildirim = NotificationCompat.Builder(context, kanalId)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle(baslik)
+            .setContentText(icerik)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(Random().nextInt(10000), bildirim)
+    }
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        periyodikGorevAyarla(this, VeriDeposu.periyotYukle(this))
+
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF58A6FF),
+                    secondary = Color(0xFF3FB950),
+                    background = Color(0xFF11161D),
+                    surface = Color(0xFF1A222D)
+                )
+            ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF11161D)) {
+                    FiyatTakipEkrani()
+                }
+            }
+        }
+    }
+
+    companion object {
+        fun periyodikGorevAyarla(context: Context, dakika: Int) {
+            val wm = WorkManager.getInstance(context)
+            if (dakika <= 0) {
+                wm.cancelUniqueWork("Y3PeriyodikFiyatTakip")
+                return
+            }
+            val sure = dakika.coerceAtLeast(15).toLong()
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val istek = PeriodicWorkRequestBuilder<FiyatKontrolWorker>(sure, TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .build()
+            wm.enqueueUniquePeriodicWork(
+                "Y3PeriyodikFiyatTakip",
+                ExistingPeriodicWorkPolicy.UPDATE,
+                istek
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FiyatTakipEkrani() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val trLocale = remember { Locale.forLanguageTag("tr-TR") }
+
+    var urunler by remember { mutableStateOf(VeriDeposu.urunleriYukle(context).toList()) }
+    var seciliUrunId by remember { mutableStateOf(urunler.firstOrNull()?.id) }
+
+    var linkInput by remember { mutableStateOf("") }
+    var isimInput by remember { mutableStateOf("") }
+    var hedefInput by remember { mutableStateOf("") }
+    var manuelFiyatInput by remember { mutableStateOf("") }
+
+    var yenilemeDk by remember { mutableIntStateOf(VeriDeposu.periyotYukle(context)) }
+    var kalanSaniye by remember { mutableIntStateOf(yenilemeDk * 60) }
+    var menuAcik by remember { mutableStateOf(false) }
+
+    var islemSuruyor by remember { mutableStateOf(false) }
+    var durumMesaji by remember { mutableStateOf("Hazır") }
+
+    val izinIsteyici = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                izinIsteyici.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    fun listeyiKaydetVeGuncelle(yeniListe: List<TakipUrunu>) {
+        urunler = yeniListe
+        VeriDeposu.urunleriKaydet(context, yeniListe)
+    }
+
+    suspend fun tumunuGuncelle() {
+        if (urunler.isEmpty() || islemSuruyor) return
+        islemSuruyor = true
+        durumMesaji = "Tüm ürünler taranıyor..."
+        val guncel = urunler.toMutableList()
+        val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+
+        for (i in guncel.indices) {
+            val u = guncel[i]
+            val sonuc = FiyatMotoru.urunFiyatiCek(context, u.url)
+            if (sonuc.basarili && sonuc.fiyat != null) {
+                guncel[i] = u.copy(
+                    sonFiyat = sonuc.fiyat,
+                    sonKontrol = zamanStr,
+                    durum = sonuc.mesaj,
+                    gecmis = (u.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                )
+            } else {
+                guncel[i] = u.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+            }
+        }
+        listeyiKaydetVeGuncelle(guncel)
+        if (yenilemeDk > 0) kalanSaniye = yenilemeDk * 60
+        islemSuruyor = false
+        durumMesaji = "Güncellendi (${SimpleDateFormat("HH:mm:ss", trLocale).format(Date())})"
+    }
+
+    LaunchedEffect(yenilemeDk, islemSuruyor) {
+        while (yenilemeDk > 0 && !islemSuruyor) {
+            delay(1000L)
+            if (kalanSaniye <= 1) {
+                kalanSaniye = yenilemeDk * 60
+                if (urunler.isNotEmpty()) {
+                    tumunuGuncelle()
+                }
+            } else {
+                kalanSaniye -= 1
+            }
+        }
+    }
+
+    val seciliUrun = urunler.find { it.id == seciliUrunId } ?: urunler.firstOrNull()
+
+    Scaffold(
+        containerColor = Color(0xFF11161D),
+        topBar = {
+            TopAppBar(
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF11161D)),
+                title = {
+                    Column {
+                        Text(
+                            "Y3 Fiyat Takip",
+                            color = Color(0xFF58A6FF),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp
+                        )
+                        val sayacMetni = if (islemSuruyor) {
+                            durumMesaji
+                        } else if (yenilemeDk > 0) {
+                            val dk = kalanSaniye / 60
+                            val sn = kalanSaniye % 60
+                            "Periyot: $yenilemeDk dk • Sonraki: %02d:%02d".format(dk, sn)
+                        } else {
+                            "Otomatik yenileme kapalı"
+                        }
+                        Text(sayacMetni, color = Color(0xFF8B949E), fontSize = 11.sp)
+                    }
+                },
+                actions = {
+                    Box {
+                        OutlinedButton(
+                            onClick = { menuAcik = true },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                if (yenilemeDk > 0) "$yenilemeDk dk" else "Kapalı",
+                                fontSize = 12.sp
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = menuAcik,
+                            onDismissRequest = { menuAcik = false }
+                        ) {
+                            listOf(15, 30, 45, 60, 120, 240, 0).forEach { secenek ->
+                                DropdownMenuItem(
+                                    text = { Text(if (secenek > 0) "$secenek Dakika" else "Kapalı") },
+                                    onClick = {
+                                        yenilemeDk = secenek
+                                        kalanSaniye = secenek * 60
+                                        VeriDeposu.periyotKaydet(context, secenek)
+                                        MainActivity.periyodikGorevAyarla(context, secenek)
+                                        menuAcik = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    TextButton(
+                        enabled = !islemSuruyor && urunler.isNotEmpty(),
+                        onClick = { scope.launch { tumunuGuncelle() } }
+                    ) {
+                        Text("Yenile", fontWeight = FontWeight.Bold)
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A222D))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = linkInput,
+                                onValueChange = { linkInput = it },
+                                label = { Text("Ürün Linki (https://...)") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            FilledTonalButton(
+                                onClick = {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val pano = cm.primaryClip?.getItemAt(0)?.text?.toString()
+                                    if (!pano.isNullOrBlank()) linkInput = pano.trim()
+                                }
+                            ) {
+                                Text("Yapıştır")
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = isimInput,
+                                onValueChange = { isimInput = it },
+                                label = { Text("Ürün Adı (Ops.)") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = hedefInput,
+                                onValueChange = { hedefInput = it },
+                                label = { Text("Hedef TL") },
+                                singleLine = true,
+                                modifier = Modifier.width(115.dp)
+                            )
+                        }
+
+                        Button(
+                            enabled = !islemSuruyor && linkInput.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF238636)),
+                            onClick = {
+                                scope.launch {
+                                    islemSuruyor = true
+                                    durumMesaji = "Sayfa taranıyor..."
+                                    val sonuc = FiyatMotoru.urunFiyatiCek(context, linkInput)
+                                    val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                    val ad = isimInput.ifBlank { sonuc.baslik ?: "Takip Edilen Ürün" }
+                                    val hedef = hedefInput.replace(",", ".").toDoubleOrNull() ?: 0.0
+                                    val fiyat = sonuc.fiyat ?: 0.0
+
+                                    val yeniUrun = TakipUrunu(
+                                        ad = ad,
+                                        url = linkInput.trim(),
+                                        hedefFiyat = hedef,
+                                        sonFiyat = fiyat,
+                                        sonKontrol = zamanStr,
+                                        durum = sonuc.mesaj,
+                                        gecmis = if (fiyat > 0) listOf(FiyatNoktasi(zamanStr, fiyat)) else emptyList()
+                                    )
+
+                                    listeyiKaydetVeGuncelle(listOf(yeniUrun) + urunler)
+                                    seciliUrunId = yeniUrun.id
+                                    linkInput = ""
+                                    isimInput = ""
+                                    hedefInput = ""
+                                    islemSuruyor = false
+                                    durumMesaji = sonuc.mesaj
+                                }
+                            }
+                        ) {
+                            Text(
+                                if (islemSuruyor) "Sayfa Taranıyor..." else "+ Takibe Al ve Fiyatı Çek",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (seciliUrun != null) {
+                item {
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A222D))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Grafik: ${seciliUrun.ad}",
+                                color = Color(0xFFE6EDF3),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+
+                            FiyatCizgiGrafigi(
+                                noktalar = seciliUrun.gecmis,
+                                hedefFiyat = seciliUrun.hedefFiyat,
+                                trLocale = trLocale,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(190.dp)
+                            )
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedTextField(
+                                    value = manuelFiyatInput,
+                                    onValueChange = { manuelFiyatInput = it },
+                                    label = { Text("Manuel Fiyat (TL)") },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                FilledTonalButton(
+                                    onClick = {
+                                        val deger = FiyatMotoru.fiyatMetniniSayiyaCevir(manuelFiyatInput)
+                                        if (deger != null) {
+                                            val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                            val guncelListe = urunler.map {
+                                                if (it.id == seciliUrun.id) {
+                                                    it.copy(
+                                                        sonFiyat = deger,
+                                                        sonKontrol = zamanStr,
+                                                        durum = "Manuel nokta eklendi",
+                                                        gecmis = (it.gecmis + FiyatNoktasi(zamanStr, deger)).takeLast(72)
+                                                    )
+                                                } else it
+                                            }
+                                            listeyiKaydetVeGuncelle(guncelListe)
+                                            manuelFiyatInput = ""
+                                        }
+                                    }
+                                ) {
+                                    Text("Ekle")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            items(urunler, key = { it.id }) { urun ->
+                val seciliMi = seciliUrun?.id == urun.id
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (seciliMi) Color(0xFF23303D) else Color(0xFF1A222D)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { seciliUrunId = urun.id }
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = urun.ad,
+                                    color = Color(0xFFE6EDF3),
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Text(
+                                        text = if (urun.sonFiyat > 0)
+                                            "Güncel: ${String.format(trLocale, "%,.2f", urun.sonFiyat)} TL"
+                                        else "Güncel: Bekleniyor",
+                                        color = Color(0xFF58A6FF),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
+                                    if (urun.hedefFiyat > 0) {
+                                        Text(
+                                            text = "Hedef: ${String.format(trLocale, "%,.0f", urun.hedefFiyat)} TL",
+                                            color = Color(0xFF3FB950),
+                                            fontSize = 13.sp
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = "${urun.sonKontrol} • ${urun.durum}",
+                                    color = Color(0xFF8B949E),
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(
+                                enabled = !islemSuruyor,
+                                onClick = {
+                                    scope.launch {
+                                        islemSuruyor = true
+                                        durumMesaji = "Güncelleniyor..."
+                                        val sonuc = FiyatMotoru.urunFiyatiCek(context, urun.url)
+                                        val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                        val guncel = urunler.map {
+                                            if (it.id == urun.id) {
+                                                if (sonuc.basarili && sonuc.fiyat != null) {
+                                                    it.copy(
+                                                        sonFiyat = sonuc.fiyat,
+                                                        sonKontrol = zamanStr,
+                                                        durum = sonuc.mesaj,
+                                                        gecmis = (it.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                                                    )
+                                                } else {
+                                                    it.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+                                                }
+                                            } else it
+                                        }
+                                        listeyiKaydetVeGuncelle(guncel)
+                                        islemSuruyor = false
+                                        durumMesaji = sonuc.mesaj
+                                    }
+                                }
+                            ) {
+                                Text("Güncelle", fontSize = 12.sp)
+                            }
+
+                            TextButton(
+                                onClick = {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(urun.url))
+                                        context.startActivity(intent)
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            ) {
+                                Text("Sayfayı Aç", fontSize = 12.sp)
+                            }
+
+                            TextButton(
+                                onClick = {
+                                    val kalan = urunler.filterNot { it.id == urun.id }
+                                    if (seciliUrunId == urun.id) seciliUrunId = kalan.firstOrNull()?.id
+                                    listeyiKaydetVeGuncelle(kalan)
+                                }
+                            ) {
+                                Text("Sil", color = Color(0xFFDA3633), fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FiyatCizgiGrafigi(
+    noktalar: List<FiyatNoktasi>,
+    hedefFiyat: Double,
+    trLocale: Locale,
+    modifier: Modifier = Modifier
+) {
+    if (noktalar.isEmpty()) {
+        Box(
+            modifier = modifier.background(Color(0xFF0D1117), RoundedCornerShape(10.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("Henüz fiyat verisi yok", color = Color(0xFF8B949E), fontSize = 12.sp)
+        }
+        return
+    }
+
+    val tumDegerler = noktalar.map { it.fiyat } + if (hedefFiyat > 0) listOf(hedefFiyat) else emptyList()
+    var minF = tumDegerler.min()
+    var maxF = tumDegerler.max()
+    if (maxF == minF) {
+        val pay = (maxF * 0.05).coerceAtLeast(10.0)
+        minF = (minF - pay).coerceAtLeast(0.0)
+        maxF += pay
+    }
+    val aralik = maxF - minF
+
+    Column(
+        modifier = modifier
+            .background(Color(0xFF0D1117), RoundedCornerShape(10.dp))
+            .padding(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "Max: ${String.format(trLocale, "%,.0f", maxF)} TL",
+                color = Color(0xFF8B949E),
+                fontSize = 11.sp
+            )
+            Text(
+                "Min: ${String.format(trLocale, "%,.0f", minF)} TL",
+                color = Color(0xFF8B949E),
+                fontSize = 11.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+
+            if (hedefFiyat > 0) {
+                val hedefOran = ((hedefFiyat - minF) / aralik).toFloat()
+                val hedefY = h - (hedefOran * (h * 0.84f) + (h * 0.08f))
+                drawLine(
+                    color = Color(0xFF3FB950),
+                    start = Offset(0f, hedefY),
+                    end = Offset(w, hedefY),
+                    strokeWidth = 3f
+                )
+            }
+
+            if (noktalar.size == 1) {
+                drawCircle(
+                    color = Color(0xFF58A6FF),
+                    radius = 9f,
+                    center = Offset(w / 2f, h / 2f)
+                )
+            } else {
+                val adimX = w / (noktalar.size - 1)
+                val yol = Path()
+
+                noktalar.forEachIndexed { idx, nokta ->
+                    val x = idx * adimX
+                    val oran = ((nokta.fiyat - minF) / aralik).toFloat()
+                    val y = h - (oran * (h * 0.84f) + (h * 0.08f))
+
+                    if (idx == 0) yol.moveTo(x, y) else yol.lineTo(x, y)
+                    drawCircle(color = Color(0xFF58A6FF), radius = 6f, center = Offset(x, y))
+                }
+
+                drawPath(
+                    path = yol,
+                    color = Color(0xFF58A6FF),
+                    style = Stroke(width = 4f, cap = StrokeCap.Round)
+                )
+            }
+        }
+    }
+}
