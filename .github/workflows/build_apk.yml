@@ -903,4 +903,314 @@ jobs:
                                               )
 
                                               listeyiKaydetVeGuncelle(listOf(yeniUrun) + urunler)
-                                              seciliUrunId = yeniU
+                                              seciliUrunId = yeniUrun.id
+                                              linkInput = ""
+                                              isimInput = ""
+                                              hedefInput = ""
+                                              islemSuruyor = false
+                                              durumMesaji = sonuc.mesaj
+                                          }
+                                      }
+                                  ) {
+                                      Text(
+                                          if (islemSuruyor) "Sayfa Taranıyor..." else "+ Takibe Al ve Fiyatı Çek",
+                                          color = Color.White,
+                                          fontWeight = FontWeight.Bold
+                                      )
+                                  }
+                              }
+                          }
+                      }
+
+                      if (seciliUrun != null) {
+                          item {
+                              Card(
+                                  shape = RoundedCornerShape(14.dp),
+                                  colors = CardDefaults.cardColors(containerColor = Color(0xFF1A222D))
+                              ) {
+                                  Column(
+                                      modifier = Modifier.padding(14.dp),
+                                      verticalArrangement = Arrangement.spacedBy(8.dp)
+                                  ) {
+                                      Text(
+                                          text = "Grafik: ${seciliUrun.ad}",
+                                          color = Color(0xFFE6EDF3),
+                                          fontWeight = FontWeight.Bold,
+                                          fontSize = 14.sp,
+                                          maxLines = 1,
+                                          overflow = TextOverflow.Ellipsis
+                                      )
+
+                                      FiyatCizgiGrafigi(
+                                          noktalar = seciliUrun.gecmis,
+                                          hedefFiyat = seciliUrun.hedefFiyat,
+                                          trLocale = trLocale,
+                                          modifier = Modifier
+                                              .fillMaxWidth()
+                                              .height(190.dp)
+                                      )
+
+                                      Row(
+                                          verticalAlignment = Alignment.CenterVertically,
+                                          horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                      ) {
+                                          OutlinedTextField(
+                                              value = manuelFiyatInput,
+                                              onValueChange = { manuelFiyatInput = it },
+                                              label = { Text("Manuel Fiyat (TL)") },
+                                              singleLine = true,
+                                              modifier = Modifier.weight(1f)
+                                          )
+                                          FilledTonalButton(
+                                              onClick = {
+                                                  val deger = FiyatMotoru.fiyatMetniniSayiyaCevir(manuelFiyatInput)
+                                                  if (deger != null) {
+                                                      val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                                      val guncelListe = urunler.map {
+                                                          if (it.id == seciliUrun.id) {
+                                                              it.copy(
+                                                                  sonFiyat = deger,
+                                                                  sonKontrol = zamanStr,
+                                                                  durum = "Manuel nokta eklendi",
+                                                                  gecmis = (it.gecmis + FiyatNoktasi(zamanStr, deger)).takeLast(72)
+                                                              )
+                                                          } else it
+                                                      }
+                                                      listeyiKaydetVeGuncelle(guncelListe)
+                                                      manuelFiyatInput = ""
+                                                  }
+                                              }
+                                          ) {
+                                              Text("Ekle")
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      items(urunler, key = { it.id }) { urun ->
+                          val seciliMi = seciliUrun?.id == urun.id
+                          Card(
+                              shape = RoundedCornerShape(12.dp),
+                              colors = CardDefaults.cardColors(
+                                  containerColor = if (seciliMi) Color(0xFF23303D) else Color(0xFF1A222D)
+                              ),
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .clickable { seciliUrunId = urun.id }
+                          ) {
+                              Column(modifier = Modifier.padding(12.dp)) {
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth(),
+                                      horizontalArrangement = Arrangement.SpaceBetween,
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Column(modifier = Modifier.weight(1f)) {
+                                          Text(
+                                              text = urun.ad,
+                                              color = Color(0xFFE6EDF3),
+                                              fontWeight = FontWeight.Bold,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                          Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                              Text(
+                                                  text = if (urun.sonFiyat > 0)
+                                                      "Güncel: ${String.format(trLocale, "%,.2f", urun.sonFiyat)} TL"
+                                                  else "Güncel: Bekleniyor",
+                                                  color = Color(0xFF58A6FF),
+                                                  fontWeight = FontWeight.Bold,
+                                                  fontSize = 14.sp
+                                              )
+                                              if (urun.hedefFiyat > 0) {
+                                                  Text(
+                                                      text = "Hedef: ${String.format(trLocale, "%,.0f", urun.hedefFiyat)} TL",
+                                                      color = Color(0xFF3FB950),
+                                                      fontSize = 13.sp
+                                                  )
+                                              }
+                                          }
+                                          Text(
+                                              text = "${urun.sonKontrol} • ${urun.durum}",
+                                              color = Color(0xFF8B949E),
+                                              fontSize = 11.sp,
+                                              maxLines = 1,
+                                              overflow = TextOverflow.Ellipsis
+                                          )
+                                      }
+                                  }
+
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth(),
+                                      horizontalArrangement = Arrangement.End
+                                  ) {
+                                      TextButton(
+                                          enabled = !islemSuruyor,
+                                          onClick = {
+                                              scope.launch {
+                                                  islemSuruyor = true
+                                                  durumMesaji = "Güncelleniyor..."
+                                                  val sonuc = FiyatMotoru.urunFiyatiCek(context, urun.url)
+                                                  val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                                  val guncel = urunler.map {
+                                                      if (it.id == urun.id) {
+                                                          if (sonuc.basarili && sonuc.fiyat != null) {
+                                                              it.copy(
+                                                                  sonFiyat = sonuc.fiyat,
+                                                                  sonKontrol = zamanStr,
+                                                                  durum = sonuc.mesaj,
+                                                                  gecmis = (it.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                                                              )
+                                                          } else {
+                                                              it.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+                                                          }
+                                                      } else it
+                                                  }
+                                                  listeyiKaydetVeGuncelle(guncel)
+                                                  islemSuruyor = false
+                                                  durumMesaji = sonuc.mesaj
+                                              }
+                                          }
+                                      ) {
+                                          Text("Güncelle", fontSize = 12.sp)
+                                      }
+
+                                      TextButton(
+                                          onClick = {
+                                              try {
+                                                  val intent = Intent(Intent.ACTION_VIEW, Uri.parse(urun.url))
+                                                  context.startActivity(intent)
+                                              } catch (_: Exception) {
+                                              }
+                                          }
+                                      ) {
+                                          Text("Sayfayı Aç", fontSize = 12.sp)
+                                      }
+
+                                      TextButton(
+                                          onClick = {
+                                              val kalan = urunler.filterNot { it.id == urun.id }
+                                              if (seciliUrunId == urun.id) seciliUrunId = kalan.firstOrNull()?.id
+                                              listeyiKaydetVeGuncelle(kalan)
+                                          }
+                                      ) {
+                                          Text("Sil", color = Color(0xFFDA3633), fontSize = 12.sp)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FiyatCizgiGrafigi(
+              noktalar: List<FiyatNoktasi>,
+              hedefFiyat: Double,
+              trLocale: Locale,
+              modifier: Modifier = Modifier
+          ) {
+              if (noktalar.isEmpty()) {
+                  Box(
+                      modifier = modifier.background(Color(0xFF0D1117), RoundedCornerShape(10.dp)),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("Henüz fiyat verisi yok", color = Color(0xFF8B949E), fontSize = 12.sp)
+                  }
+                  return
+              }
+
+              val tumDegerler = noktalar.map { it.fiyat } + if (hedefFiyat > 0) listOf(hedefFiyat) else emptyList()
+              var minF = tumDegerler.min()
+              var maxF = tumDegerler.max()
+              if (maxF == minF) {
+                  val pay = (maxF * 0.05).coerceAtLeast(10.0)
+                  minF = (minF - pay).coerceAtLeast(0.0)
+                  maxF += pay
+              }
+              val aralik = maxF - minF
+
+              Column(
+                  modifier = modifier
+                      .background(Color(0xFF0D1117), RoundedCornerShape(10.dp))
+                      .padding(10.dp)
+              ) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween
+                  ) {
+                      Text(
+                          "Max: ${String.format(trLocale, "%,.0f", maxF)} TL",
+                          color = Color(0xFF8B949E),
+                          fontSize = 11.sp
+                      )
+                      Text(
+                          "Min: ${String.format(trLocale, "%,.0f", minF)} TL",
+                          color = Color(0xFF8B949E),
+                          fontSize = 11.sp
+                      )
+                  }
+
+                  Spacer(modifier = Modifier.height(6.dp))
+
+                  Canvas(modifier = Modifier.fillMaxSize()) {
+                      val w = size.width
+                      val h = size.height
+
+                      if (hedefFiyat > 0) {
+                          val hedefOran = ((hedefFiyat - minF) / aralik).toFloat()
+                          val hedefY = h - (hedefOran * (h * 0.84f) + (h * 0.08f))
+                          drawLine(
+                              color = Color(0xFF3FB950),
+                              start = Offset(0f, hedefY),
+                              end = Offset(w, hedefY),
+                              strokeWidth = 3f
+                          )
+                      }
+
+                      if (noktalar.size == 1) {
+                          drawCircle(
+                              color = Color(0xFF58A6FF),
+                              radius = 9f,
+                              center = Offset(w / 2f, h / 2f)
+                          )
+                      } else {
+                          val adimX = w / (noktalar.size - 1)
+                          val yol = Path()
+
+                          noktalar.forEachIndexed { idx, nokta ->
+                              val x = idx * adimX
+                              val oran = ((nokta.fiyat - minF) / aralik).toFloat()
+                              val y = h - (oran * (h * 0.84f) + (h * 0.08f))
+
+                              if (idx == 0) yol.moveTo(x, y) else yol.lineTo(x, y)
+                              drawCircle(color = Color(0xFF58A6FF), radius = 6f, center = Offset(x, y))
+                          }
+
+                          drawPath(
+                              path = yol,
+                              color = Color(0xFF58A6FF),
+                              style = Stroke(width = 4f, cap = StrokeCap.Round)
+                          )
+                      }
+                  }
+              }
+          }
+          """)
+          '
+
+      - name: Gradle 8.9 Kur
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: APK Derle
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: APK Dosyasini Yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Y3-Fiyat-Takip-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
