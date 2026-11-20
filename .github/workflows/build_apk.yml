@@ -15,22 +15,892 @@ jobs:
       - name: JDK 17 Kur
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
 
-      - name: Android SDK Lisanslarini Onayla
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - name: Android SDK Lisanslarini Kabul Et
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses"
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
 
-      - name: Gradle 8.9 Kur
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
+      - name: Android Proje Dosyalarini Olustur
+        run: |
+          python3 -c '
+          import os, textwrap
 
-      - name: APK Derle
-        run: gradle assembleDebug --stacktrace
+          def yaz(yol, icerik):
+              klasor = os.path.dirname(yol)
+              if klasor:
+                  os.makedirs(klasor, exist_ok=True)
+              with open(yol, "w", encoding="utf-8") as f:
+                  f.write(textwrap.dedent(icerik).lstrip("\n"))
 
-      - name: APK Dosyasini Yukle
-        uses: actions/upload-artifact@v4
-        with:
-          name: Y3-Fiyat-Takip-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          yaz("gradle.properties", r"""
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          """)
+
+          yaz("settings.gradle.kts", r"""
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "Y3FiyatTakip"
+          include(":app")
+          """)
+
+          yaz("build.gradle.kts", r"""
+          plugins {
+              id("com.android.application") version "8.7.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          """)
+
+          yaz("app/build.gradle.kts", r"""
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.y3.fiyattakip"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.y3.fiyattakip"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation(platform("androidx.compose:compose-bom:2024.11.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.work:work-runtime-ktx:2.10.0")
+              implementation("org.jsoup:jsoup:1.18.3")
+              implementation("com.google.code.gson:gson:2.11.0")
+          }
+          """)
+
+          yaz("app/src/main/AndroidManifest.xml", r"""
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="Y3 Fiyat Takip"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          """)
+
+          yaz("app/src/main/java/com/y3/fiyattakip/MainActivity.kt", r"""
+          package com.y3.fiyattakip
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import androidx.work.*
+          import com.google.gson.Gson
+          import com.google.gson.reflect.TypeToken
+          import kotlinx.coroutines.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.json.JSONTokener
+          import org.jsoup.Jsoup
+          import org.jsoup.nodes.Document
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import java.util.concurrent.TimeUnit
+
+          data class FiyatNoktasi(
+              val zaman: String,
+              val fiyat: Double
+          )
+
+          data class TakipUrunu(
+              val id: String = UUID.randomUUID().toString(),
+              val ad: String,
+              val url: String,
+              val hedefFiyat: Double,
+              val sonFiyat: Double,
+              val sonKontrol: String,
+              val durum: String,
+              val gecmis: List<FiyatNoktasi> = emptyList()
+          )
+
+          object VeriDeposu {
+              private const val PREF_NAME = "y3_fiyat_takip_prefs"
+              private const val KEY_URUNLER = "urun_listesi"
+              private const val KEY_PERIYOT_DK = "yenileme_dk"
+              private val gson = Gson()
+
+              fun urunleriYukle(context: Context): MutableList<TakipUrunu> {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val json = prefs.getString(KEY_URUNLER, null) ?: return mutableListOf()
+                  val type = object : TypeToken<MutableList<TakipUrunu>>() {}.type
+                  return try {
+                      gson.fromJson(json, type) ?: mutableListOf()
+                  } catch (_: Exception) {
+                      mutableListOf()
+                  }
+              }
+
+              fun urunleriKaydet(context: Context, liste: List<TakipUrunu>) {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  prefs.edit().putString(KEY_URUNLER, gson.toJson(liste)).apply()
+              }
+
+              fun periyotYukle(context: Context): Int {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  return prefs.getInt(KEY_PERIYOT_DK, 30)
+              }
+
+              fun periyotKaydet(context: Context, dk: Int) {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  prefs.edit().putInt(KEY_PERIYOT_DK, dk).apply()
+              }
+          }
+
+          object FiyatMotoru {
+              private const val USER_AGENT =
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+              data class CekimSonucu(
+                  val basarili: Boolean,
+                  val baslik: String?,
+                  val fiyat: Double?,
+                  val mesaj: String
+              )
+
+              suspend fun urunFiyatiCek(context: Context, url: String): CekimSonucu {
+                  val temizUrl = url.trim()
+                  if (!temizUrl.startsWith("http://") && !temizUrl.startsWith("https://")) {
+                      return CekimSonucu(false, null, null, "Geçersiz URL (http/https gerekli)")
+                  }
+
+                  val hizliSonuc = withContext(Dispatchers.IO) {
+                      try {
+                          val doc = Jsoup.connect(temizUrl)
+                              .userAgent(USER_AGENT)
+                              .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+                              .timeout(10000)
+                              .followRedirects(true)
+                              .get()
+                          htmlIcindenFiyatBul(doc, doc.outerHtml(), temizUrl)
+                      } catch (_: Exception) {
+                          null
+                      }
+                  }
+                  if (hizliSonuc != null && hizliSonuc.basarili) {
+                      return hizliSonuc
+                  }
+
+                  val renderedHtml = webViewIleHtmlCek(context, temizUrl)
+                  if (!renderedHtml.isNullOrBlank() && renderedHtml.length > 500) {
+                      return withContext(Dispatchers.Default) {
+                          val doc = Jsoup.parse(renderedHtml, temizUrl)
+                          val sonuc = htmlIcindenFiyatBul(doc, renderedHtml, temizUrl)
+                          sonuc.copy(mesaj = "WebView: ${sonuc.mesaj}")
+                      }
+                  }
+
+                  return CekimSonucu(false, hizliSonuc?.baslik, null, "Sayfa yüklenemedi veya bot koruması")
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private suspend fun webViewIleHtmlCek(context: Context, url: String): String? {
+                  return withTimeoutOrNull(28000L) {
+                      withContext(Dispatchers.Main) {
+                          suspendCancellableCoroutine { cont ->
+                              val webView = WebView(context.applicationContext)
+                              var tamamlandi = false
+
+                              fun bitir(sonuc: String?) {
+                                  if (!tamamlandi) {
+                                      tamamlandi = true
+                                      try {
+                                          webView.stopLoading()
+                                          webView.destroy()
+                                      } catch (_: Exception) {
+                                      }
+                                      if (cont.isActive) cont.resumeWith(Result.success(sonuc))
+                                  }
+                              }
+
+                              webView.settings.javaScriptEnabled = true
+                              webView.settings.domStorageEnabled = true
+                              webView.settings.userAgentString = USER_AGENT
+                              webView.settings.loadsImagesAutomatically = false
+
+                              webView.webViewClient = object : WebViewClient() {
+                                  override fun onPageFinished(view: WebView?, finishedUrl: String?) {
+                                      view?.postDelayed({
+                                          if (!tamamlandi) {
+                                              view.evaluateJavascript(
+                                                  "(function(){return document.documentElement.outerHTML;})();"
+                                              ) { rawJson ->
+                                                  val html = try {
+                                                      JSONTokener(rawJson ?: "").nextValue() as? String
+                                                  } catch (_: Exception) {
+                                                      null
+                                                  }
+                                                  bitir(html)
+                                              }
+                                          }
+                                      }, 4500L)
+                                  }
+                              }
+
+                              cont.invokeOnCancellation {
+                                  try {
+                                      webView.stopLoading()
+                                      webView.destroy()
+                                  } catch (_: Exception) {
+                                  }
+                              }
+
+                              webView.loadUrl(url)
+                          }
+                      }
+                  }
+              }
+
+              private fun htmlIcindenFiyatBul(doc: Document, html: String, url: String): CekimSonucu {
+                  val baslik = doc.select("meta[property=og:title]").attr("content")
+                      .ifBlank { doc.title() }
+                      .trim()
+                      .take(90)
+                      .ifBlank { "Takip Edilen Ürün" }
+
+                  if (url.lowercase().contains("hepsiburada.com")) {
+                      val hbSonuc = hepsiburadaFiyatBul(doc, html)
+                      if (hbSonuc != null) {
+                          return CekimSonucu(true, baslik, hbSonuc.first, hbSonuc.second)
+                      }
+                  }
+
+                  val metaSeciciler = listOf(
+                      "meta[property=product:price:amount]",
+                      "meta[property=og:price:amount]",
+                      "meta[name=twitter:data1]",
+                      "meta[itemprop=price]"
+                  )
+                  for (secici in metaSeciciler) {
+                      val f = fiyatMetniniSayiyaCevir(doc.select(secici).attr("content"))
+                      if (f != null) return CekimSonucu(true, baslik, f, "Meta etiketinden okundu")
+                  }
+
+                  for (script in doc.select("script[type=application/ld+json]")) {
+                      val f = jsonLdIcindenFiyatBul(script.data())
+                      if (f != null) return CekimSonucu(true, baslik, f, "JSON-LD verisinden okundu")
+                  }
+
+                  val whole = doc.selectFirst(".a-price .a-price-whole")
+                  if (whole != null) {
+                      val tam = whole.text().replace(Regex("[^\\d]"), "")
+                      val kurus = doc.selectFirst(".a-price .a-price-fraction")?.text()?.replace(Regex("[^\\d]"), "") ?: "00"
+                      val f = "$tam.$kurus".toDoubleOrNull()
+                      if (f != null && f > 0) return CekimSonucu(true, baslik, f, "Amazon fiyat bloğundan okundu")
+                  }
+
+                  val cssSeciciler = listOf(
+                      ".prc-dsc",
+                      ".prc-slg",
+                      ".prc-box-dscntd",
+                      "[data-testid=price-current-price]",
+                      "[data-test-id=price-current-price]",
+                      "[data-test-id=default-price]",
+                      ".a-price .a-offscreen",
+                      ".pt_v8",
+                      ".pb_v8",
+                      ".newPrice ins",
+                      ".unf-p-summary-price",
+                      "[data-test=product-price]",
+                      ".product-list__price",
+                      "[itemprop=price]"
+                  )
+                  for (secici in cssSeciciler) {
+                      val el = doc.selectFirst(secici)
+                      if (el != null) {
+                          val ham = el.attr("content").ifBlank { el.text() }
+                          val f = fiyatMetniniSayiyaCevir(ham)
+                          if (f != null) return CekimSonucu(true, baslik, f, "CSS seçicisinden okundu")
+                      }
+                  }
+
+                  val scriptFiyat = scriptIciFiyatBul(html)
+                  if (scriptFiyat != null) {
+                      return CekimSonucu(true, baslik, scriptFiyat, "Sayfa JSON verisinden okundu")
+                  }
+
+                  val yasakli = listOf("sigorta", "garanti", "ek hizmet", "taksit", "kupon", "kargo")
+                  for (el in doc.select("span, div, p, ins, strong, b")) {
+                      val txt = el.text().trim()
+                      if ((txt.contains("TL") || txt.contains("₺")) && txt.length in 3..26) {
+                          val ebeveyn = (el.parent()?.text() ?: "").lowercase()
+                          if (yasakli.any { ebeveyn.contains(it) }) continue
+                          val f = fiyatMetniniSayiyaCevir(txt)
+                          if (f != null && f >= 20.0) {
+                              return CekimSonucu(true, baslik, f, "Metin taraması ile okundu")
+                          }
+                      }
+                  }
+
+                  return CekimSonucu(false, baslik, null, "Fiyat bulunamadı (${baslik.take(24)})")
+              }
+
+              private fun hepsiburadaFiyatBul(doc: Document, html: String): Pair<Double, String>? {
+                  val hbSeciciler = listOf(
+                      "[data-test-id=default-price]",
+                      "[data-test-id=price-current-price]",
+                      "[data-test-id=final-price]",
+                      "div[data-test-id=price]",
+                      "span[data-bind*=currentPrice]"
+                  )
+                  for (secici in hbSeciciler) {
+                      val kapsayici = doc.selectFirst(secici)
+                      if (kapsayici != null) {
+                          val kopya = Jsoup.parseBodyFragment(kapsayici.outerHtml())
+                          kopya.select("del, s, [data-test-id=prev-price], [class*=old], [class*=prev]").remove()
+                          val f = fiyatMetniniSayiyaCevir(kopya.text())
+                          if (f != null) return Pair(f, "Hepsiburada ana fiyat")
+                      }
+                  }
+
+                  val desenler = listOf(
+                      Regex("\"product_prices\"\\s*:\\s*\\[\\s*\"([0-9.,]+)\""),
+                      Regex("\"product_unit_prices\"\\s*:\\s*\\[\\s*\"([0-9.,]+)\""),
+                      Regex("\"finalPrice\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+                      Regex("\"currentPrice\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+                      Regex("\"price\"\\s*:\\s*([0-9]+(?:\\.[0-9]{1,2})?)\\s*,\\s*\"currency\"\\s*:\\s*\"TRY\"")
+                  )
+                  for (desen in desenler) {
+                      val m = desen.find(html)
+                      if (m != null) {
+                          val f = fiyatMetniniSayiyaCevir(m.groupValues[1])
+                          if (f != null) return Pair(f, "Hepsiburada sayfa verisi")
+                      }
+                  }
+                  return null
+              }
+
+              private fun scriptIciFiyatBul(html: String): Double? {
+                  val desenler = listOf(
+                      Regex("\"discountedPrice\"\\s*:\\s*\\{[^}]*?\"value\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+                      Regex("\"sellingPrice\"\\s*:\\s*\\{[^}]*?\"value\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)"),
+                      Regex("\"discountedPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"sellingPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"currentPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"finalPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"priceAmount\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"salePrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?"),
+                      Regex("\"lowPrice\"\\s*:\\s*\"?([0-9]+(?:[.,][0-9]{1,2})?)\"?")
+                  )
+                  for (d in desenler) {
+                      val m = d.find(html)
+                      if (m != null) {
+                          val f = fiyatMetniniSayiyaCevir(m.groupValues[1])
+                          if (f != null && f >= 10.0) return f
+                      }
+                  }
+                  return null
+              }
+
+              private fun jsonLdIcindenFiyatBul(rawJson: String): Double? {
+                  return try {
+                      val trimmed = rawJson.trim()
+                      if (trimmed.startsWith("{")) {
+                          offersFiyatOku(JSONObject(trimmed))
+                      } else if (trimmed.startsWith("[")) {
+                          val arr = JSONArray(trimmed)
+                          for (i in 0 until arr.length()) {
+                              offersFiyatOku(arr.getJSONObject(i))?.let { return it }
+                          }
+                          null
+                      } else null
+                  } catch (_: Exception) {
+                      null
+                  }
+              }
+
+              private fun offersFiyatOku(obj: JSONObject): Double? {
+                  for (k in listOf("price", "lowPrice", "highPrice")) {
+                      if (obj.has(k)) {
+                          fiyatMetniniSayiyaCevir(obj.optString(k))?.let { return it }
+                      }
+                  }
+                  if (obj.has("offers")) {
+                      val offers = obj.get("offers")
+                      if (offers is JSONObject) return offersFiyatOku(offers)
+                      if (offers is JSONArray) {
+                          for (i in 0 until offers.length()) {
+                              offersFiyatOku(offers.getJSONObject(i))?.let { return it }
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              fun fiyatMetniniSayiyaCevir(metin: String?): Double? {
+                  if (metin.isNullOrBlank()) return null
+                  val temiz = metin.replace("TL", "", ignoreCase = true)
+                      .replace("₺", "")
+                      .replace("TRY", "", ignoreCase = true)
+                      .trim()
+                  val eslesme = Regex("\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?")
+                      .find(temiz)?.value ?: return null
+
+                  val normalize = when {
+                      eslesme.contains(".") && eslesme.contains(",") -> {
+                          if (eslesme.lastIndexOf(",") > eslesme.lastIndexOf(".")) {
+                              eslesme.replace(".", "").replace(",", ".")
+                          } else {
+                              eslesme.replace(",", "")
+                          }
+                      }
+                      eslesme.contains(",") -> {
+                          val parcalar = eslesme.split(",")
+                          if (parcalar.last().length == 2) eslesme.replace(",", ".")
+                          else eslesme.replace(",", "")
+                      }
+                      eslesme.contains(".") -> {
+                          val parcalar = eslesme.split(".")
+                          if (parcalar.last().length == 3 && parcalar.first().length <= 3) {
+                              eslesme.replace(".", "")
+                          } else eslesme
+                      }
+                      else -> eslesme
+                  }
+                  val sonuc = normalize.toDoubleOrNull() ?: return null
+                  return if (sonuc in 1.0..5_000_000.0) sonuc else null
+              }
+          }
+
+          class FiyatKontrolWorker(
+              appContext: Context,
+              workerParams: WorkerParameters
+          ) : CoroutineWorker(appContext, workerParams) {
+
+              override suspend fun doWork(): Result {
+                  val liste = VeriDeposu.urunleriYukle(applicationContext)
+                  if (liste.isEmpty()) return Result.success()
+
+                  val saatFormat = SimpleDateFormat("dd.MM HH:mm", Locale.forLanguageTag("tr-TR"))
+                  val zamanStr = saatFormat.format(Date())
+
+                  for (i in liste.indices) {
+                      val u = liste[i]
+                      val sonuc = FiyatMotoru.urunFiyatiCek(applicationContext, u.url)
+                      if (sonuc.basarili && sonuc.fiyat != null) {
+                          val yeniGecmis = (u.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                          if ((u.sonFiyat > 0 && sonuc.fiyat < u.sonFiyat) ||
+                              (u.hedefFiyat > 0 && sonuc.fiyat <= u.hedefFiyat)
+                          ) {
+                              bildirimGoster(
+                                  applicationContext,
+                                  "İndirim Yakalandı: ${u.ad}",
+                                  "Yeni fiyat: ${String.format(Locale.forLanguageTag("tr-TR"), "%,.2f", sonuc.fiyat)} TL"
+                              )
+                          }
+                          liste[i] = u.copy(
+                              sonFiyat = sonuc.fiyat,
+                              sonKontrol = zamanStr,
+                              durum = sonuc.mesaj,
+                              gecmis = yeniGecmis
+                          )
+                      } else {
+                          liste[i] = u.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+                      }
+                  }
+
+                  VeriDeposu.urunleriKaydet(applicationContext, liste)
+                  return Result.success()
+              }
+
+              private fun bildirimGoster(context: Context, baslik: String, icerik: String) {
+                  val kanalId = "y3_indirim_kanali"
+                  val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val kanal = NotificationChannel(kanalId, "Fiyat İndirim Uyarıları", NotificationManager.IMPORTANCE_HIGH)
+                      manager.createNotificationChannel(kanal)
+                  }
+                  val bildirim = NotificationCompat.Builder(context, kanalId)
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle(baslik)
+                      .setContentText(icerik)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setAutoCancel(true)
+                      .build()
+                  manager.notify(Random().nextInt(10000), bildirim)
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  periyodikGorevAyarla(this, VeriDeposu.periyotYukle(this))
+
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              primary = Color(0xFF58A6FF),
+                              secondary = Color(0xFF3FB950),
+                              background = Color(0xFF11161D),
+                              surface = Color(0xFF1A222D)
+                          )
+                      ) {
+                          Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF11161D)) {
+                              FiyatTakipEkrani()
+                          }
+                      }
+                  }
+              }
+
+              companion object {
+                  fun periyodikGorevAyarla(context: Context, dakika: Int) {
+                      val wm = WorkManager.getInstance(context)
+                      if (dakika <= 0) {
+                          wm.cancelUniqueWork("Y3PeriyodikFiyatTakip")
+                          return
+                      }
+                      val sure = dakika.coerceAtLeast(15).toLong()
+                      val constraints = Constraints.Builder()
+                          .setRequiredNetworkType(NetworkType.CONNECTED)
+                          .build()
+                      val istek = PeriodicWorkRequestBuilder<FiyatKontrolWorker>(sure, TimeUnit.MINUTES)
+                          .setConstraints(constraints)
+                          .build()
+                      wm.enqueueUniquePeriodicWork(
+                          "Y3PeriyodikFiyatTakip",
+                          ExistingPeriodicWorkPolicy.UPDATE,
+                          istek
+                      )
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun FiyatTakipEkrani() {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val trLocale = remember { Locale.forLanguageTag("tr-TR") }
+
+              var urunler by remember { mutableStateOf(VeriDeposu.urunleriYukle(context).toList()) }
+              var seciliUrunId by remember { mutableStateOf(urunler.firstOrNull()?.id) }
+
+              var linkInput by remember { mutableStateOf("") }
+              var isimInput by remember { mutableStateOf("") }
+              var hedefInput by remember { mutableStateOf("") }
+              var manuelFiyatInput by remember { mutableStateOf("") }
+
+              var yenilemeDk by remember { mutableIntStateOf(VeriDeposu.periyotYukle(context)) }
+              var kalanSaniye by remember { mutableIntStateOf(yenilemeDk * 60) }
+              var menuAcik by remember { mutableStateOf(false) }
+
+              var islemSuruyor by remember { mutableStateOf(false) }
+              var durumMesaji by remember { mutableStateOf("Hazır") }
+
+              val izinIsteyici = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { }
+
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED
+                      ) {
+                          izinIsteyici.launch(Manifest.permission.POST_NOTIFICATIONS)
+                      }
+                  }
+              }
+
+              fun listeyiKaydetVeGuncelle(yeniListe: List<TakipUrunu>) {
+                  urunler = yeniListe
+                  VeriDeposu.urunleriKaydet(context, yeniListe)
+              }
+
+              suspend fun tumunuGuncelle() {
+                  if (urunler.isEmpty() || islemSuruyor) return
+                  islemSuruyor = true
+                  durumMesaji = "Tüm ürünler taranıyor..."
+                  val guncel = urunler.toMutableList()
+                  val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+
+                  for (i in guncel.indices) {
+                      val u = guncel[i]
+                      val sonuc = FiyatMotoru.urunFiyatiCek(context, u.url)
+                      if (sonuc.basarili && sonuc.fiyat != null) {
+                          guncel[i] = u.copy(
+                              sonFiyat = sonuc.fiyat,
+                              sonKontrol = zamanStr,
+                              durum = sonuc.mesaj,
+                              gecmis = (u.gecmis + FiyatNoktasi(zamanStr, sonuc.fiyat)).takeLast(72)
+                          )
+                      } else {
+                          guncel[i] = u.copy(sonKontrol = zamanStr, durum = sonuc.mesaj)
+                      }
+                  }
+                  listeyiKaydetVeGuncelle(guncel)
+                  if (yenilemeDk > 0) kalanSaniye = yenilemeDk * 60
+                  islemSuruyor = false
+                  durumMesaji = "Güncellendi (${SimpleDateFormat("HH:mm:ss", trLocale).format(Date())})"
+              }
+
+              LaunchedEffect(yenilemeDk, islemSuruyor) {
+                  while (yenilemeDk > 0 && !islemSuruyor) {
+                      delay(1000L)
+                      if (kalanSaniye <= 1) {
+                          kalanSaniye = yenilemeDk * 60
+                          if (urunler.isNotEmpty()) {
+                              tumunuGuncelle()
+                          }
+                      } else {
+                          kalanSaniye -= 1
+                      }
+                  }
+              }
+
+              val seciliUrun = urunler.find { it.id == seciliUrunId } ?: urunler.firstOrNull()
+
+              Scaffold(
+                  containerColor = Color(0xFF11161D),
+                  topBar = {
+                      TopAppBar(
+                          colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF11161D)),
+                          title = {
+                              Column {
+                                  Text(
+                                      "Y3 Fiyat Takip",
+                                      color = Color(0xFF58A6FF),
+                                      fontWeight = FontWeight.Bold,
+                                      fontSize = 18.sp
+                                  )
+                                  val sayacMetni = if (islemSuruyor) {
+                                      durumMesaji
+                                  } else if (yenilemeDk > 0) {
+                                      val dk = kalanSaniye / 60
+                                      val sn = kalanSaniye % 60
+                                      "Periyot: $yenilemeDk dk • Sonraki: %02d:%02d".format(dk, sn)
+                                  } else {
+                                      "Otomatik yenileme kapalı"
+                                  }
+                                  Text(sayacMetni, color = Color(0xFF8B949E), fontSize = 11.sp)
+                              }
+                          },
+                          actions = {
+                              Box {
+                                  OutlinedButton(
+                                      onClick = { menuAcik = true },
+                                      contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                  ) {
+                                      Text(
+                                          if (yenilemeDk > 0) "$yenilemeDk dk" else "Kapalı",
+                                          fontSize = 12.sp
+                                      )
+                                  }
+                                  DropdownMenu(
+                                      expanded = menuAcik,
+                                      onDismissRequest = { menuAcik = false }
+                                  ) {
+                                      listOf(15, 30, 45, 60, 120, 240, 0).forEach { secenek ->
+                                          DropdownMenuItem(
+                                              text = { Text(if (secenek > 0) "$secenek Dakika" else "Kapalı") },
+                                              onClick = {
+                                                  yenilemeDk = secenek
+                                                  kalanSaniye = secenek * 60
+                                                  VeriDeposu.periyotKaydet(context, secenek)
+                                                  MainActivity.periyodikGorevAyarla(context, secenek)
+                                                  menuAcik = false
+                                              }
+                                          )
+                                      }
+                                  }
+                              }
+
+                              TextButton(
+                                  enabled = !islemSuruyor && urunler.isNotEmpty(),
+                                  onClick = { scope.launch { tumunuGuncelle() } }
+                              ) {
+                                  Text("Yenile", fontWeight = FontWeight.Bold)
+                              }
+                          }
+                      )
+                  }
+              ) { padding ->
+                  LazyColumn(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .padding(horizontal = 14.dp, vertical = 8.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      item {
+                          Card(
+                              shape = RoundedCornerShape(14.dp),
+                              colors = CardDefaults.cardColors(containerColor = Color(0xFF1A222D))
+                          ) {
+                              Column(
+                                  modifier = Modifier.padding(14.dp),
+                                  verticalArrangement = Arrangement.spacedBy(8.dp)
+                              ) {
+                                  Row(
+                                      verticalAlignment = Alignment.CenterVertically,
+                                      horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                  ) {
+                                      OutlinedTextField(
+                                          value = linkInput,
+                                          onValueChange = { linkInput = it },
+                                          label = { Text("Ürün Linki (https://...)") },
+                                          singleLine = true,
+                                          modifier = Modifier.weight(1f)
+                                      )
+                                      FilledTonalButton(
+                                          onClick = {
+                                              val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                              val pano = cm.primaryClip?.getItemAt(0)?.text?.toString()
+                                              if (!pano.isNullOrBlank()) linkInput = pano.trim()
+                                          }
+                                      ) {
+                                          Text("Yapıştır")
+                                      }
+                                  }
+
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      OutlinedTextField(
+                                          value = isimInput,
+                                          onValueChange = { isimInput = it },
+                                          label = { Text("Ürün Adı (Ops.)") },
+                                          singleLine = true,
+                                          modifier = Modifier.weight(1f)
+                                      )
+                                      OutlinedTextField(
+                                          value = hedefInput,
+                                          onValueChange = { hedefInput = it },
+                                          label = { Text("Hedef TL") },
+                                          singleLine = true,
+                                          modifier = Modifier.width(115.dp)
+                                      )
+                                  }
+
+                                  Button(
+                                      enabled = !islemSuruyor && linkInput.isNotBlank(),
+                                      modifier = Modifier.fillMaxWidth(),
+                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF238636)),
+                                      onClick = {
+                                          scope.launch {
+                                              islemSuruyor = true
+                                              durumMesaji = "Sayfa taranıyor..."
+                                              val sonuc = FiyatMotoru.urunFiyatiCek(context, linkInput)
+                                              val zamanStr = SimpleDateFormat("dd.MM HH:mm", trLocale).format(Date())
+                                              val ad = isimInput.ifBlank { sonuc.baslik ?: "Takip Edilen Ürün" }
+                                              val hedef = hedefInput.replace(",", ".").toDoubleOrNull() ?: 0.0
+                                              val fiyat = sonuc.fiyat ?: 0.0
+
+                                              val yeniUrun = TakipUrunu(
+                                                  ad = ad,
+                                                  url = linkInput.trim(),
+                                                  hedefFiyat = hedef,
+                                                  sonFiyat = fiyat,
+                                                  sonKontrol = zamanStr,
+                                                  durum = sonuc.mesaj,
+                                                  gecmis = if (fiyat > 0) listOf(FiyatNoktasi(zamanStr, fiyat)) else emptyList()
+                                              )
+
+                                              listeyiKaydetVeGuncelle(listOf(yeniUrun) + urunler)
+                                              seciliUrunId = yeniU
